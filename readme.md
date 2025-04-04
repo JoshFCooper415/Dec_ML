@@ -1,172 +1,140 @@
-# ML-Enhanced Production Planning Quick Start Guide
+# ML-Enhanced Production Planning
 
-This guide will help you get started with the ML-Enhanced Production Planning package.
+This project implements a machine learning-enhanced decomposition approach for multi-period, multi-scenario production planning problems.
 
-## Prerequisites
+## Overview
 
-- Python 3.8 or higher
-- Gurobi Optimizer (with valid license)
+Production planning problems involve determining when to set up production and how much to produce in each time period to satisfy demand while minimizing costs. The ML-enhanced approach uses a neural network to accelerate the solution process by predicting good solutions for the subproblems.
+
+## Project Structure
+
+```
+production_planning/
+├── data/
+│   ├── data_structures.py    # Common data structures
+│   ├── data_loader.py        # Dataset for training
+│   └── problem_generator.py  # Problem generation
+├── models/
+│   ├── neural_network.py     # Neural network architecture
+│   ├── ml_predictor.py       # ML prediction interface
+│   └── benders.py            # Benders decomposition solver
+├── solvers/
+│   ├── timeblock.py          # Time block subproblem
+│   └── scenario.py           # Scenario subproblem
+├── utils/
+│   └── evaluation.py         # Evaluation utilities
+├── standalone_train.py       # Training script with no dependencies
+├── performance_evaluation.py # Performance evaluation script
+├── data_generator.py         # Data generation for training
+└── README.md                 # Project documentation
+```
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.8+
 - PyTorch
+- Gurobi Optimizer
+- NumPy, Pandas, Matplotlib
+- tqdm (for progress bars)
 
-## Setup
+### Installation
 
-1. Create and activate a virtual environment:
-
+1. Create a virtual environment:
    ```bash
-   # Create virtual environment
    python -m venv venv
-   
-   # Activate on Windows
-   venv\Scripts\activate
-   
-   # Activate on Linux/Mac
-   source venv/bin/activate
+   venv\Scripts\activate  # Windows
+   source venv/bin/activate  # Linux/Mac
    ```
 
-2. Install the package in development mode:
-
+2. Install dependencies:
    ```bash
-   pip install -e .
+   pip install torch numpy pandas matplotlib tqdm gurobipy
    ```
 
-3. Install additional requirements:
+## Quick Start Guide
 
-   ```bash
-   pip install tqdm
-   ```
+### 1. Generate Training Data
 
-## Running the Complete Pipeline
-
-The easiest way to get started is to run the complete pipeline, which will:
-
-1. Generate synthetic training data
-2. Train neural network models
-3. Solve test problems
-4. Run benchmarks
+Generate synthetic training data for the ML model:
 
 ```bash
-python run_pipeline.py
+python data_generator.py --output_dir data --block_sizes 3,6,9 --samples_per_size 500
 ```
 
-This will create three directories:
-- `data/` - Contains generated training data
-- `models/` - Contains trained neural network models
-- `results/` - Contains benchmark results
+This will create dataset files (`.npz`) for different block sizes.
 
-## Running Individual Steps
+### 2. Train Neural Network Models
 
-### 1. Generating Training Data
-
-Generate synthetic training data for different block sizes:
+Train the neural network models on the generated data:
 
 ```bash
-python -m production_planning.data_generator --output_dir data --block_sizes 3,6,9 --samples_per_size 1000
+python standalone_train.py --data_dir data --output_dir models --epochs 30
 ```
 
-Options:
-- `--output_dir` - Output directory for data files
-- `--block_sizes` - Comma-separated list of time block sizes
-- `--samples_per_size` - Number of samples per block size
-- `--seed` - Random seed for reproducibility
-- `--varied_params` - Vary problem parameters randomly
+### 3. Evaluate Performance
 
-### 2. Training Models
-
-Train neural network models on the generated data:
+Run a performance evaluation to measure the solution quality and computation time:
 
 ```bash
-python -m production_planning.train --data_dir data --output_dir models
+python performance_evaluation.py --problem_sizes 12:2,24:3,36:2 --trials 2 --output_dir results
 ```
 
-Options:
-- `--data_dir` - Directory containing training data
-- `--output_dir` - Output directory for models
-- `--epochs` - Number of training epochs
-- `--batch_size` - Batch size for training
-- `--lr` - Learning rate
-- `--hidden_dim` - Hidden dimension for neural network
+This generates a comprehensive HTML report with performance metrics and visualizations.
 
-### 3. Solving Problems
+## Command-Line Options
 
-Solve a production planning problem:
+### Data Generation
+- `--output_dir`: Output directory for data files
+- `--block_sizes`: Comma-separated list of time block sizes
+- `--samples_per_size`: Number of samples per block size
 
-```bash
-# With ML enhancement
-python -m production_planning.solve --periods 24 --scenarios 3 --use_ml
+### Training
+- `--data_dir`: Directory containing training data
+- `--output_dir`: Output directory for models
+- `--epochs`: Number of training epochs
+- `--batch_size`: Batch size for training
 
-# Without ML (exact solution)
-python -m production_planning.solve --periods 24 --scenarios 3
-```
+### Performance Evaluation
+- `--problem_sizes`: Problem sizes as periods:scenarios (e.g., 12:2,24:3)
+- `--seeds`: Random seeds for reproducibility
+- `--trials`: Number of trials per problem size
+- `--output_dir`: Output directory for results
+- `--max_iterations`: Maximum Benders iterations
 
-Options:
-- `--periods` - Number of time periods
-- `--scenarios` - Number of scenarios
-- `--seed` - Random seed
-- `--model_dir` - Directory containing models
-- `--use_ml` - Enable ML enhancement
-- `--max_iterations` - Maximum number of Benders iterations
+## Key Features
 
-### 4. Running Benchmarks
+1. **Decomposition-Based Approach**: Uses Benders decomposition to split the problem into master and subproblems.
 
-Run benchmarks to compare ML-enhanced and exact solutions:
+2. **Machine Learning Enhancement**: Neural networks predict solutions to subproblems, reducing computation time.
 
-```bash
-python -m production_planning.benchmark --output results/benchmark_results.pkl
-```
+3. **Multi-Task Learning**: A single neural network predicts setup decisions, production quantities, and inventory levels.
 
-Options:
-- `--output` - Output file for benchmark results
-- `--model_dir` - Directory containing models
-- `--trials` - Number of trials per problem size
-- `--max_size` - Maximum problem size index to test
+4. **Performance Evaluation**: Comprehensive benchmarking comparing ML-enhanced vs. exact solutions.
 
-## Visualizing Results
+## Performance Metrics
 
-To visualize the benchmark results, you can use the following code:
+The performance evaluation script reports:
+- Computation time
+- Number of iterations
+- MIP gap (optimality gap)
+- Solution characteristics (setup decisions, inventory levels)
 
-```python
-import pickle
-import matplotlib.pyplot as plt
-import numpy as np
+## Output Examples
 
-# Load benchmark results
-with open("results/benchmark_results.pkl", "rb") as f:
-    results = pickle.load(f)
-
-# Filter successful results
-success_results = [r for r in results if r["status"] == "success"]
-
-# Extract data for plotting
-periods = [r["periods"] for r in success_results]
-speedups = [r["speedup"] for r in success_results]
-obj_diffs = [r["obj_rel_diff"] for r in success_results]
-
-# Plot speedup vs problem size
-plt.figure(figsize=(10, 6))
-plt.scatter(periods, speedups)
-plt.xlabel("Number of Periods")
-plt.ylabel("Speedup (×)")
-plt.title("ML Speedup vs Problem Size")
-plt.grid(True)
-plt.savefig("results/speedup_plot.png")
-
-# Plot optimality gap vs problem size
-plt.figure(figsize=(10, 6))
-plt.scatter(periods, obj_diffs)
-plt.xlabel("Number of Periods")
-plt.ylabel("Optimality Gap (%)")
-plt.title("ML Optimality Gap vs Problem Size")
-plt.grid(True)
-plt.savefig("results/gap_plot.png")
-
-print("Results visualized and saved to results/ directory")
-```
+The HTML report includes:
+- Summary statistics tables
+- Time vs. problem size plots
+- MIP gap analysis
+- Time breakdown charts
 
 ## Troubleshooting
 
-If you encounter any issues:
+- **Import errors**: Make sure your directory structure matches the project structure.
+- **Gurobi license**: Ensure your Gurobi license is properly set up.
+- **GPU usage**: If CUDA is available, the neural networks will use GPU acceleration.
 
-1. **Gurobi License Error**: Make sure your Gurobi license is properly set up
-2. **Memory Error**: Reduce batch size or number of samples
-3. **Import Error**: Make sure the package is installed in development mode with `pip install -e .`
-4. **CUDA Error**: Set device to CPU if GPU is not available or has limited memory
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
