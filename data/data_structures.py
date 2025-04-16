@@ -26,7 +26,8 @@ class TimingStats:
     subproblem_time: float
     master_time: float
     num_iterations: int
-    ml_prediction_time: float = 0.0  # New field for ML prediction time
+    ml_prediction_time: float = 0.0  # ML prediction time
+    laporte_cuts_time: float = 0.0   # New field for Laporte cuts time
 
 class Solution(NamedTuple):
     """NamedTuple for storing solution data."""

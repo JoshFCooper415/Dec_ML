@@ -72,7 +72,7 @@ def run_benchmark(problem_sizes=None, seeds=None, num_trials=3, use_ml=False, ou
             
             try:
                 start_time = time.time()
-                exact_lb, exact_ub, exact_stats = exact_decomp.solve(max_iterations=30)
+                exact_lb, exact_ub, exact_stats = exact_decomp.solve(max_iterations=50)
                 total_time = time.time() - start_time
                 
                 # Calculate MIP gap - relative difference between upper and lower bounds

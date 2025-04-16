@@ -2,6 +2,8 @@ from typing import Dict, Tuple, Set
 import gurobipy as gp
 from gurobipy import GRB
 import time
+import torch
+import numpy as np
 
 from data.data_structures import ScenarioData, ProblemParameters
 from models.ml_predictor import MLSubproblemPredictor
@@ -43,47 +45,55 @@ class MLTimeBlockSubproblem:
             Tuple of (cost, is_feasible)
         """
         if self.ml_predictor is None:
-            return None, False
+            # No ML predictor available, skip prediction
+            return float('inf'), False
         
+        if not self.ml_predictor.is_loaded or self.ml_predictor.model is None:
+            # ML model not loaded, skip prediction
+            return float('inf'), False
+            
         try:
             # Prepare features
             features = self.ml_predictor.prepare_features(
                 fixed_setups=fixed_setups,
-                demands=self.scenario_data.demands,
-                initial_inventory=initial_inventory,
-                params=self.params,
-                block_size=self.num_periods,
-                start_period=self.start_period
+                scenario=self.scenario_data  # Pass the entire scenario object
             )
             
             # Get prediction
-            setup, production, inventory = self.ml_predictor.predict_subproblem_solution(
-                features, self.num_periods
-            )
+            setup_pred, production_plan, inventory_plan = self.ml_predictor.predict_subproblem_solution(
+                features, self.num_periods)
+            
+            # Check if prediction succeeded
+            if setup_pred is None or production_plan is None or inventory_plan is None:
+                print("ML prediction returned None values. Falling back to Gurobi.")
+                return float('inf'), False
             
             # Store solution
             self.ml_solution = {
-                'setup': setup.tolist(),
-                'production': production.tolist(),
-                'inventory': list(inventory) + [0.0]  # Add final inventory
+                'setup': [fixed_setups.get(self.start_period + t, False) for t in range(self.num_periods)],
+                'production': production_plan.tolist() if isinstance(production_plan, np.ndarray) else production_plan,
+                'inventory': (list(inventory_plan) if isinstance(inventory_plan, np.ndarray) else inventory_plan) + [0.0]  # Add final inventory
             }
             
             # Calculate approximate cost
             cost = 0.0
             for t in range(self.num_periods):
-                if setup[t]:
+                period = self.start_period + t
+                if period in fixed_setups and fixed_setups[period]:
                     cost += self.params.fixed_cost
-                cost += production[t] * self.params.production_cost
-                cost += inventory[t] * self.params.holding_cost
+                cost += production_plan[t] * self.params.production_cost
+                cost += inventory_plan[t] * self.params.holding_cost
             
             # Verify solution feasibility
             is_feasible = self.verify_solution_feasibility(
-                initial_inventory, fixed_setups, setup, production, inventory
+                initial_inventory, fixed_setups, 
+                self.ml_solution['setup'], production_plan, inventory_plan
             )
             
             if is_feasible:
                 return cost, True
             else:
+                print("ML predicted solution is not feasible. Falling back to Gurobi.")
                 self.ml_solution = None
                 return float('inf'), False
                 

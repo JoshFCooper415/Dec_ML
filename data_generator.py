@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 Standalone data generator for production planning ML.
 
