@@ -1,7 +1,7 @@
 import random
 from data.data_structures import ScenarioData, ProblemParameters
 
-def create_test_problem(num_periods: int = 12, num_scenarios: int = 3, seed: int = 42) -> ProblemParameters:
+def create_test_problem(num_periods: int = 12, num_scenarios: int = 3, periods_per_block=12, seed: int = 42) -> ProblemParameters:
     """Create a test problem instance.
     
     Args:
@@ -29,11 +29,11 @@ def create_test_problem(num_periods: int = 12, num_scenarios: int = 3, seed: int
         ))
     
     # Define linking periods (every third period)
-    linking_periods = set(range(0, num_periods, 3))
+    linking_periods = set(range(0, num_periods, periods_per_block))
     
     return ProblemParameters(
         total_periods=num_periods,
-        periods_per_block=3,
+        periods_per_block=periods_per_block,
         capacity=300,
         fixed_cost=1000,
         holding_cost=5,
