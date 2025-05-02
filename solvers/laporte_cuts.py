@@ -1,9 +1,8 @@
-import time
-from typing import Dict, Set, Tuple, List
 import gurobipy as gp
 from gurobipy import GRB
+from typing import Dict, Tuple, List, Optional
 
-from data.data_structures import ProblemParameters, TimingStats, Solution
+from data.data_structures import ProblemParameters
 
 class LaporteCutsGenerator:
     """
@@ -54,24 +53,26 @@ class LaporteCutsGenerator:
         self.scenario_lower_bounds[scenario_idx] = obj_value
         return obj_value
     
-    def generate_laporte_cut(self, 
-                            scenario_idx: int, 
-                            current_solution: Dict[int, bool], 
-                            subproblem_value: float) -> Tuple[List[float], float]:
+    def generate_laporte_cut(
+        self, 
+        scenario_idx: int, 
+        current_solution: Dict[int, bool], 
+        subproblem_value: float
+    ) -> Tuple[List[float], float]:
         """
         Generate a Laporte-Louveaux cut for a specific scenario.
         
         The classic L-shaped method cut for binary first-stage variables has the form:
-        z_s ≥ (v_s(x̂) - L_s) * (∑_{i∈X̂} x_i - ∑_{i∉X̂} x_i - |X̂| + 1) + L_s
+        z_s ≥ (v_s(x̂) - L_s) * (∑_{i∈x̂} x_i - ∑_{i∉x̂} x_i - |x̂| + 1) + L_s
         
         Where:
         - z_s is the value function variable for scenario s
         - v_s(x̂) is the optimal objective value for scenario s given solution x̂
         - L_s is a lower bound on the objective value for scenario s
-        - X̂ is the set of facilities located in the current solution
+        - x̂ is the set of facilities located in the current solution
         
         For our application, we use a modified form:
-        z_s ≥ v_s(x̂) + ∑_{i∈V\X̂: b_i^s>0} (L_s - v_s(x̂)) * x_i
+        z_s ≥ v_s(x̂) + ∑_{i∈V\\x̂: b_i^s>0} (L_s - v_s(x̂)) * x_i
         
         This is stronger than the classic form and exploits the structure of our problem.
         
@@ -106,14 +107,16 @@ class LaporteCutsGenerator:
         
         return coefficients, constant_term
     
-    def add_laporte_cut(self, 
-                       model: gp.Model, 
-                       scenario_idx: int, 
-                       fixed_setups: Dict[int, bool], 
-                       objective_value: float, 
-                       cut_counter: int) -> bool:
+    def add_laporte_cut(
+        self, 
+        model: gp.Model, 
+        scenario_idx: int, 
+        fixed_setups: Dict[int, bool], 
+        objective_value: float, 
+        cut_counter: int
+    ) -> Optional[gp.Constr]:
         """
-        Add a Laporte-Louveaux cut to the master problem.
+        Add a Laporte-Louveaux cut to the master problem as a lazy constraint.
         
         Args:
             model: Gurobi model representing the master problem
@@ -123,11 +126,11 @@ class LaporteCutsGenerator:
             cut_counter: Counter for naming cuts
             
         Returns:
-            True if a cut was added, False otherwise
+            The added constraint object or None if no cut was added
         """
         if objective_value == float('inf'):
             # Cannot add an optimality cut for an infeasible subproblem
-            return False
+            return None
         
         # Generate the Laporte cut
         coefficients, constant_term = self.generate_laporte_cut(
@@ -137,7 +140,7 @@ class LaporteCutsGenerator:
         # Get the value function variable for this scenario
         theta = model.getVarByName(f"theta[{scenario_idx}]")
         if theta is None:
-            return False
+            return None
         
         # Create the expression for the cut
         expr = gp.LinExpr(constant_term)
@@ -148,9 +151,10 @@ class LaporteCutsGenerator:
                     expr.addTerms(coef, var)
         
         # Add the constraint: theta >= expr
-        model.addConstr(
+        laporte_constr = model.addConstr(
             theta >= expr,
             name=f"laporte_cut_{scenario_idx}_{cut_counter}"
         )
         
-        return True
+        # Return the constraint so it can be marked as lazy
+        return laporte_constr

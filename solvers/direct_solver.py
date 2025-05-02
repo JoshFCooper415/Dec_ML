@@ -45,14 +45,36 @@ class DirectSolver:
                 production[s][t] = model.addVar(lb=0, name=f"production[{s},{t}]")
                 inventory[s][t] = model.addVar(lb=0, name=f"inventory[{s},{t}]")
         
-        # Non-anticipativity constraints for linking periods
+        # ————— Build “here-and-now” variables —————
+        here_setup      = {}
+        here_production = {}
         for t in self.params.linking_periods:
-            # Use the first scenario as reference
-            ref_var = setup[0][t]
-            
-            # Force all other scenarios to match
-            for s in range(1, len(self.params.scenarios)):
-                model.addConstr(setup[s][t] == ref_var, name=f"non_anticipativity[{s},{t}]")
+            # one master setup‐binary per linking period
+            here_setup[t] = model.addVar(
+                vtype=GRB.BINARY, name=f"here_setup[{t}]"
+            )
+            # one master production‐continuous per linking period
+            here_production[t] = model.addVar(
+                lb=0, name=f"here_production[{t}]"
+            )
+            # link the two so capacity still holds
+            model.addConstr(
+                here_production[t] <= self.params.capacity * here_setup[t],
+                name=f"here_capacity[{t}]"
+            )
+
+        # ————— Enforce non-anticipativity —————
+        for s in range(len(self.params.scenarios)):
+            for t in self.params.linking_periods:
+                model.addConstr(
+                    setup[s][t]      == here_setup[t],
+                    name=f"non_ant_setup[{s},{t}]"
+                )
+                model.addConstr(
+                    production[s][t] == here_production[t],
+                    name=f"non_ant_prod[{s},{t}]"
+                )
+
         
         # Flow balance constraints
         for s in range(len(self.params.scenarios)):
@@ -87,9 +109,9 @@ class DirectSolver:
             scenario = self.params.scenarios[s]
             
             # Minimum number of setups needed
-            total_demand = sum(scenario.demands)
+            total_demand = sum(scenario.demands) #make this a max
             min_setups = max(1, int(total_demand // self.params.capacity) + 
-                          (1 if total_demand % self.params.capacity > 0 else 0))
+                          (1 if total_demand % self.params.capacity > 0 else 0)) 
             
             setup_sum = gp.quicksum(setup[s][t] for t in range(self.params.total_periods))
             model.addConstr(setup_sum >= min_setups, name=f"min_setups[{s}]")

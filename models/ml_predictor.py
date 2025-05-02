@@ -1,489 +1,341 @@
+from typing import Dict, List, Tuple, Optional
 import torch
 import numpy as np
 import os
-import sys
+import time
+
+from models.neural_network import ProductionPlanningNN
+from data.data_structures import ProblemParameters, ScenarioData
+
 
 class MLSubproblemPredictor:
-    """ML predictor for subproblem solutions using transformer-based model."""
-    
-    def __init__(self, model_path='models'):
-        """Initialize the ML predictor with transformer model support.
+    """ML predictor for production planning subproblems with top-K solutions capability"""
+
+    def __init__(self, model_path='models', k=3):
+        """
+        Initialize the ML predictor with top-K capability.
         
         Args:
-            model_path: Path to the model checkpoint file
+            model_path: Path to model files
+            k: Number of top solutions to generate (default: 3)
         """
         self.model = None
         self.is_loaded = False
+        self.input_dim = None
+        self.num_periods = None
+        self.hidden_dim = None
+        self.k = k  # Store the number of solutions to generate
+        self.prediction_time = 0.0  # Track total prediction time
+
+        # Load available model files
         self.available_models = []
-        self.model_info = {}  # Store model info for debugging
-        self.use_transformer = False  # Flag to indicate we're using transformer model
-        
-        print("\nInitializing ML predictor with transformer model support")
-        
-        # Check if model_path is a string - avoid permission issues
-        if not isinstance(model_path, str):
-            print(f"Invalid model_path: {model_path}")
-            return
-            
-        # If model_path is a directory, try to find any model files in it
-        if os.path.isdir(model_path):
+        if isinstance(model_path, str) and os.path.isdir(model_path):
+            self.available_models = [
+                os.path.join(model_path, f)
+                for f in os.listdir(model_path)
+                if f.endswith((".pth", ".pt"))
+            ]
+
+        # Attempt to load models
+        for path in self.available_models:
             try:
-                print(f"Searching for model files in directory: {model_path}")
-                for filename in os.listdir(model_path):
-                    if filename.endswith(".pth") or filename.endswith(".pt"):
-                        self.available_models.append(os.path.join(model_path, filename))
-                        
-                if self.available_models:
-                    print(f"Found {len(self.available_models)} model files in {model_path}")
-                else:
-                    print(f"No model files found in {model_path}")
-            except PermissionError as e:
-                print(f"Permission error accessing directory {model_path}: {str(e)}")
+                checkpoint = torch.load(path, map_location='cpu',weights_only=False)
+
+                if 'model_state_dict' in checkpoint:
+                    self._create_model_from_checkpoint(checkpoint)
+                    print(f"Successfully loaded model from {path}")
+                    self.is_loaded = True
+                    break
+
             except Exception as e:
-                print(f"Error accessing directory {model_path}: {str(e)}")
-        
-        # Try to find model in default locations
-        possible_paths = [
-            # Don't add model_path if it's just 'models' or a directory
-            model_path if not model_path == 'models' and not os.path.isdir(model_path) else None,
-            "./models/predictor_model.pth",
-            "../models/predictor_model.pth",
-            "./models/production_planning_model_production_planning_ml_data_block3.pt",
-            "../models/production_planning_model_production_planning_ml_data_block3.pt",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "predictor_model.pth"),
-        ] + self.available_models  # Add any models found in directory
-        
-        # Remove duplicates and None values
-        possible_paths = [p for p in possible_paths if p is not None]
-        possible_paths = list(dict.fromkeys(possible_paths))  # Remove duplicates while preserving order
-        
-        # Try each path and load the model
-        for path in possible_paths:
-            if os.path.exists(path) and os.path.isfile(path):
-                print(f"Attempting to load model from {path}")
-                
-                try:
-                    # First, try to allowlist numpy scalar global - needed for PyTorch 2.6
-                    try:
-                        # This is a fix for PyTorch 2.6 weights_only=True restriction
-                        torch.serialization.add_safe_globals(["numpy._core.multiarray.scalar"])
-                    except (AttributeError, ImportError, ValueError) as e:
-                        print(f"Failed to add numpy.scalar to safe globals: {str(e)}")
-                    
-                    # Load with weights_only=False - less secure but more likely to work
-                    checkpoint = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
-                    
-                    # Check if it's a dictionary with model_state_dict
-                    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                        print(f"Found model state dict in {path}")
-                        
-                        # Try to create and load the model
-                        try:
-                            # Import the transformer model
-                            # Note: You'll need to ensure this import works in your project structure
-                            # If needed, you can directly copy the TransformerProductionPlanningNN class here
-                            try:
-                                from models.transformer_neural_network import TransformerProductionPlanningNN
-                                print("Successfully imported TransformerProductionPlanningNN")
-                            except ImportError:
-                                # If the transformer model isn't available as a module, 
-                                # import the original model and we'll create a transformer model manually
-                                print("Couldn't import transformer model, will create one manually")
-                                from models.neural_network import TransformerProductionPlanningNN
-                            
-                            # Check if we have the necessary parameters
-                            if all(k in checkpoint for k in ['input_dim', 'num_periods']):
-                                # Get parameters from checkpoint
-                                input_dim = checkpoint['input_dim']
-                                num_periods = checkpoint['num_periods']
-                                hidden_dim = checkpoint.get('hidden_dim', 128)
-                                
-                                # Create the transformer model
-                                model = TransformerProductionPlanningNN(
-                                    input_dim=input_dim,
-                                    num_periods=num_periods,
-                                    hidden_dim=hidden_dim,
-                                    num_heads=4,  # Default value
-                                    num_layers=2  # Default value
-                                )
-                                
-                                # Try to load the state dict - this might fail due to architecture differences
-                                try:
-                                    model.load_state_dict(checkpoint['model_state_dict'])
-                                    print("Successfully loaded existing weights into transformer model")
-                                except Exception as e:
-                                    print(f"Could not load weights into transformer model: {str(e)}")
-                                    print("Using transformer model with fresh weights")
-                                
-                                model.eval()  # Set to evaluation mode
-                                
-                                self.model = model
-                                self.input_dim = input_dim
-                                self.num_periods = num_periods
-                                self.hidden_dim = hidden_dim
-                                self.is_loaded = True
-                                
-                                self.model_info = {
-                                    'input_dim': input_dim,
-                                    'num_periods': num_periods,
-                                    'hidden_dim': hidden_dim,
-                                    'path': path,
-                                    'model_type': 'transformer'
-                                }
-                                
-                                print(f"Successfully created transformer model with parameters:")
-                                print(f"  input_dim={input_dim}, num_periods={num_periods}, hidden_dim={hidden_dim}")
-                                
-                                if 'metrics' in checkpoint:
-                                    print(f"Original model metrics: {checkpoint['metrics']}")
-                                
-                                break
-                            else:
-                                print(f"State dict missing required parameters")
-                        except Exception as e:
-                            print(f"Error creating transformer model from state dict: {str(e)}")
-                    else:
-                        # Try to load it directly as a model - less likely to work with architecture change
-                        try:
-                            model = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
-                            
-                            if hasattr(model, 'forward'):  # Check if it's a PyTorch module
-                                print("Loaded model directly, will attempt to convert to transformer")
-                                
-                                # Try to extract parameters
-                                if hasattr(model, 'input_dim') and hasattr(model, 'num_periods'):
-                                    input_dim = model.input_dim
-                                    num_periods = model.num_periods
-                                    hidden_dim = getattr(model, 'hidden_dim', 128)
-                                    
-                                    # Import the transformer model
-                                    try:
-                                        from models.transformer_neural_network import TransformerProductionPlanningNN
-                                    except ImportError:
-                                        # Define TransformerProductionPlanningNN class here if import fails
-                                        # This would be a copy of the class from the other file
-                                        raise ImportError("TransformerProductionPlanningNN not available")
-                                    
-                                    # Create a new transformer model
-                                    transformer_model = TransformerProductionPlanningNN(
-                                        input_dim=input_dim,
-                                        num_periods=num_periods,
-                                        hidden_dim=hidden_dim
-                                    )
-                                    transformer_model.eval()
-                                    
-                                    self.model = transformer_model
-                                    self.input_dim = input_dim
-                                    self.num_periods = num_periods
-                                    self.hidden_dim = hidden_dim
-                                    self.is_loaded = True
-                                    
-                                    self.model_info = {
-                                        'input_dim': input_dim,
-                                        'num_periods': num_periods,
-                                        'hidden_dim': hidden_dim,
-                                        'path': path,
-                                        'model_type': 'transformer_converted'
-                                    }
-                                    
-                                    print(f"Created fresh transformer model based on loaded model parameters")
-                                    break
-                                else:
-                                    print("Loaded model doesn't have required attributes")
-                            else:
-                                print(f"Loaded object is not a PyTorch model")
-                        except Exception as e:
-                            print(f"Error loading as direct model: {str(e)}")
-                
-                except Exception as e:
-                    print(f"Error loading model file: {str(e)}")
-        
-        # Create a transformer model with the correct dimensions if none was loaded
-        if not self.is_loaded or self.model is None:
-            print("\nNo valid ML predictor model could be loaded.")
-            print("Creating a transformer model with default dimensions.")
-            
-            try:
-                # Try to import TransformerProductionPlanningNN
-                try:
-                    from models.transformer_neural_network import TransformerProductionPlanningNN
-                except ImportError:
-                    # Insert the TransformerProductionPlanningNN class here if import fails
-                    # This would be a copy of the class code
-                    raise ImportError("TransformerProductionPlanningNN not available")
-                
-                # Determine sizes based on the block size
-                block_size = 6  # Default block size
-                
-                # From the data generator, we know the feature structure:
-                # - X_setup: block_size dimensions
-                # - X_params: 4 dimensions (capacity, fixed_cost, holding_cost, production_cost)
-                # - X_demands: block_size dimensions
-                # - X_init_inv: 1 dimension
-                # Total input dimensions: 2*block_size + 5
-                input_dim = 2 * block_size + 5
-                hidden_dim = 128  # Default hidden dimension
-                
-                model = TransformerProductionPlanningNN(
-                    input_dim=input_dim,
-                    num_periods=block_size,
-                    hidden_dim=hidden_dim,
-                    num_heads=4,
-                    num_layers=2
-                )
-                model.eval()  # Set to evaluation mode
-                
-                self.model = model
-                self.input_dim = input_dim
-                self.num_periods = block_size
-                self.hidden_dim = hidden_dim
-                self.is_loaded = True
-                
-                self.model_info = {
-                    'input_dim': input_dim,
-                    'num_periods': block_size,
-                    'hidden_dim': hidden_dim,
-                    'path': 'generated_transformer_model',
-                    'model_type': 'transformer_new'
-                }
-                
-                print(f"Created transformer model with default dimensions:")
-                print(f"  input_dim={input_dim}, num_periods={block_size}, hidden_dim={hidden_dim}")
-            except Exception as e:
-                print(f"Error creating transformer model: {str(e)}")
-                self.model = None
-                self.is_loaded = False
-                print("Will run without ML predictions.")
+                print(f"Error loading {path}: {str(e)}")
+
+        if not self.is_loaded:
+            print("Warning: No valid model file found in specified path.")
+            self._create_default_mlp()
+
+    def _create_model_from_checkpoint(self, checkpoint):
+        """Helper to create model from checkpoint"""
+        self.input_dim = checkpoint['input_dim']
+        self.num_periods = checkpoint['num_periods']
+        self.hidden_dim = checkpoint.get('hidden_dim', 128)
+
+        # Basic validation
+        expected_input_dim = 2 * self.num_periods + 5
+        if self.input_dim != expected_input_dim:
+            print(f"Warning: Loaded model input_dim ({self.input_dim}) does not match expected ({expected_input_dim}) for num_periods={self.num_periods}.")
+
+        model_type = checkpoint.get('model_type', 'standard')
+        if model_type == 'transformer':
+             from models.transformer_neural_network import TransformerProductionPlanningNN
+             num_heads = checkpoint.get('num_heads', 4)
+             num_layers = checkpoint.get('num_layers', 2)
+             self.model = TransformerProductionPlanningNN(
+                 input_dim=self.input_dim,
+                 num_periods=self.num_periods,
+                 hidden_dim=self.hidden_dim,
+                 num_heads=num_heads,
+                 num_layers=num_layers
+             )
+             print("Loaded Transformer model.")
         else:
-            print("ML model loaded successfully and ready for predictions.")
-            
-        # Print model info for debugging
-        if self.is_loaded and hasattr(self, 'input_dim'):
-            print(f"\nModel info: input_dim={self.input_dim}, num_periods={getattr(self, 'num_periods', 'unknown')}")
-    
-    def prepare_features(self, fixed_setups, scenario):
-        """Prepare features for the ML model to match the training data structure.
+             self.model = ProductionPlanningNN(
+                 input_dim=self.input_dim,
+                 num_periods=self.num_periods,
+                 hidden_dim=self.hidden_dim
+             )
+             print("Loaded Standard NN model.")
+
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.eval()
+
+    def _create_default_mlp(self):
+        """Create MLP with safe defaults if no model file is loaded"""
+        self.num_periods = 30
+        self.input_dim = 2 * self.num_periods + 5
+        self.hidden_dim = 128
+        print(f"Warning: No model file found. Creating default MLP with block size {self.num_periods} and input dim {self.input_dim}.")
+
+        self.model = ProductionPlanningNN(
+            input_dim=self.input_dim,
+            num_periods=self.num_periods,
+            hidden_dim=self.hidden_dim
+        )
+        self.model.eval()
+        self.is_loaded = True
+
+    def prepare_features(self, fixed_setups: Dict[int, bool], scenario: ScenarioData, 
+                        params: ProblemParameters, start_period: int, initial_inventory: float):
+        """Prepare input features for the ML model, matching training data structure."""
+        if not self.is_loaded or self.model is None:
+             print("Error: Attempting to prepare features, but ML model is not loaded.")
+             return None
+
+        block_size = self.num_periods
+
+        # 1. Setup features (binary) - shape (block_size,)
+        setup_vector = np.zeros(block_size, dtype=np.float32)
+        for t in range(block_size):
+            period_in_full_horizon = start_period + t
+            if period_in_full_horizon in params.linking_periods:
+                 setup_vector[t] = 1.0 if fixed_setups.get(period_in_full_horizon, False) else 0.0
+
+        # 2. Problem parameters - shape (4,)
+        params_vector = np.array([
+            params.capacity,
+            params.fixed_cost,
+            params.holding_cost,
+            params.production_cost
+        ], dtype=np.float32)
+
+        # 3. Demand values - shape (block_size,)
+        demands = np.zeros(block_size, dtype=np.float32)
+        end_period_in_block = min(start_period + block_size, len(scenario.demands))
+        actual_demands_in_block = scenario.demands[start_period : end_period_in_block]
+        demands[:len(actual_demands_in_block)] = actual_demands_in_block
+
+        # 4. Initial inventory - shape (1,)
+        init_inv_vector = np.array([initial_inventory], dtype=np.float32)
+
+        # Combine all features
+        feature_vector = np.concatenate([
+            setup_vector,
+            params_vector,
+            demands,
+            init_inv_vector
+        ])
+
+        # Verify final dimension
+        if len(feature_vector) != self.input_dim:
+             print(f"CRITICAL Error: Prepared feature vector length ({len(feature_vector)}) does not match loaded model input dimension ({self.input_dim}).")
+             print(f"Debug Info: block_size={block_size}, setup={len(setup_vector)}, params={len(params_vector)}, demands={len(demands)}, init_inv={len(init_inv_vector)}")
+             return None
+
+        return torch.FloatTensor(feature_vector).unsqueeze(0)  # Add batch dimension
+
+    def generate_alternative_setups(self, setup_probs: np.ndarray, num_alternatives: int) -> List[np.ndarray]:
+        """
+        Generate alternative setup decisions based on probability scores.
         
         Args:
-            fixed_setups: Dictionary mapping time periods to setup decisions (True/False)
-            scenario: ScenarioData object containing demand information
+            setup_probs: NumPy array of setup probabilities from the model
+            num_alternatives: Number of alternatives to generate
             
         Returns:
-            Feature tensor ready for input to the ML model
+            List of NumPy arrays with alternative binary setup decisions
         """
-        if not self.is_loaded or self.model is None:
-            print("Model not loaded, cannot prepare features")
-            return None
-            
-        try:
-            # Get block size from the model
-            block_size = getattr(self, 'num_periods', 6)  # Default to 6 if not available
-            
-            # Create setup vector from fixed_setups
-            # This should match X_setup in the training data
-            setup_vector = np.zeros(block_size)
-            for t in range(block_size):
-                period = t  # Adjust if start_period is not 0
-                if period in fixed_setups and fixed_setups[period]:
-                    setup_vector[t] = 1.0
-            
-            # Extract the relevant demands for this block
-            # This should match X_demands in the training data
-            demands = np.array(scenario.demands[:block_size])
-            if len(demands) < block_size:
-                # Pad if needed
-                demands = np.pad(demands, (0, block_size - len(demands)), 'constant')
-            
-            # Create parameters vector for production planning
-            # This should match X_params in the training data
-            params_vector = np.array([
-                getattr(scenario, 'capacity', 300),          # capacity
-                getattr(scenario, 'fixed_cost', 1000),       # fixed_cost
-                getattr(scenario, 'holding_cost', 5),        # holding_cost
-                getattr(scenario, 'production_cost', 10)     # production_cost
-            ])
-            
-            # Initial inventory - assume 0 if not specified
-            # This should match X_init_inv in the training data
-            init_inv = np.array([0.0])
-            
-            # Combine into the full feature vector in the same order as training data
-            feature_vector = np.concatenate([
-                setup_vector,           # X_setup
-                params_vector,          # X_params
-                demands,                # X_demands
-                init_inv                # X_init_inv
-            ])
-            
-            # Print feature composition for debugging
-            print(f"Feature vector composition: setup({len(setup_vector)}) + params({len(params_vector)}) + "
-                  f"demands({len(demands)}) + init_inv({len(init_inv)}) = {len(feature_vector)}")
-            
-            # Check if we have the expected input dimension
-            if hasattr(self, 'input_dim'):
-                expected_dim = self.input_dim
-                actual_dim = len(feature_vector)
-                
-                if actual_dim != expected_dim:
-                    print(f"Warning: Feature vector dimension ({actual_dim}) doesn't match model input dimension ({expected_dim})")
-                    
-                    if actual_dim < expected_dim:
-                        # Need to pad
-                        padding_size = expected_dim - actual_dim
-                        padding = np.zeros(padding_size)
-                        feature_vector = np.concatenate([feature_vector, padding])
-                        print(f"Padded feature vector from {actual_dim} to {expected_dim} dimensions")
-                    else:
-                        # Need to truncate
-                        feature_vector = feature_vector[:expected_dim]
-                        print(f"Truncated feature vector from {actual_dim} to {expected_dim} dimensions")
-            
-            # Convert to tensor and add batch dimension
-            input_tensor = torch.FloatTensor(feature_vector).unsqueeze(0)
-            print(f"Final feature dimensions: {input_tensor.shape}")
-            
-            return input_tensor
+        # Start with the deterministic (threshold 0.5) solution
+        setup_binary_base = (setup_probs > 0.5).astype(float)
+        alternatives = [setup_binary_base]
         
-        except Exception as e:
-            print(f"Error preparing features: {str(e)}")
-            traceback = sys.exc_info()[2]
-            if traceback:
-                print(f"Error at line: {traceback.tb_lineno}")
-            return None
+        # Find periods with most uncertain setup decisions (probabilities closest to 0.5)
+        uncertainty = np.abs(setup_probs - 0.5)
+        uncertain_indices = np.argsort(uncertainty)
+        
+        # Generate alternatives by flipping decisions at the most uncertain points
+        for i in range(1, num_alternatives):
+            if i <= len(uncertain_indices):
+                # Create a copy of the base setup decision
+                alt_setup = setup_binary_base.copy()
+                
+                # Flip the i-th most uncertain setup decision
+                flip_idx = uncertain_indices[i-1]
+                alt_setup[flip_idx] = 1.0 - alt_setup[flip_idx]
+                
+                # Add this alternative to the list
+                alternatives.append(alt_setup)
+                
+        return alternatives
     
-    def predict_subproblem_solution(self, features, num_periods):
-        """Predict setup, production, and inventory decisions using transformer model.
+    def generate_diverse_alternatives(self, setup_probs: np.ndarray, num_alternatives: int) -> List[np.ndarray]:
+        """
+        Generate diverse alternative setup decisions using stochastic sampling.
+        
+        Args:
+            setup_probs: NumPy array of setup probabilities from the model
+            num_alternatives: Number of alternatives to generate
+            
+        Returns:
+            List of NumPy arrays with diverse binary setup decisions
+        """
+        # Start with the deterministic (threshold 0.5) solution
+        setup_binary_base = (setup_probs > 0.5).astype(float)
+        alternatives = [setup_binary_base]
+        
+        # Set random seed for reproducibility
+        np.random.seed(42)
+        
+        # Generate additional alternatives through sampling from probabilities
+        for i in range(1, num_alternatives):
+            # Sample from Bernoulli distribution based on predicted probabilities
+            random_sample = np.random.random(len(setup_probs))
+            alt_setup = (random_sample < setup_probs).astype(float)
+            
+            # Make sure this sample is different from previous ones
+            is_duplicate = False
+            for prev_alt in alternatives:
+                if np.array_equal(alt_setup, prev_alt):
+                    is_duplicate = True
+                    break
+                    
+            # If it's a duplicate, try to modify it until it's unique
+            if is_duplicate:
+                # Find indices where the probability is close to 0.5 (most uncertain)
+                uncertainty = np.abs(setup_probs - 0.5)
+                uncertain_indices = np.argsort(uncertainty)
+                
+                # Flip the most uncertain bit
+                if len(uncertain_indices) > 0:
+                    flip_idx = uncertain_indices[0]
+                    alt_setup[flip_idx] = 1.0 - alt_setup[flip_idx]
+            
+            # Add to alternatives list
+            alternatives.append(alt_setup)
+            
+        return alternatives
+
+    def predict_top_k_solutions(self, features, num_periods):
+        """
+        Predict top-K alternative solutions for the subproblem.
         
         Args:
             features: Input features tensor
-            num_periods: Number of time periods
+            num_periods: Number of periods in the current block
             
         Returns:
-            Tuple of (setup_decisions, production_quantities, inventory_levels)
+            List of K tuples (setup_binary, production_plan, inventory_plan)
+            Each tuple is a candidate solution. Returns empty list on failure.
         """
+        start_time = time.time()
+        
         if not self.is_loaded or self.model is None:
-            print("Model not loaded, cannot make predictions")
-            return None, None, None
-        
+             print("Error: Cannot predict, ML model is not loaded.")
+             return []
         if features is None:
-            print("Invalid features, cannot make predictions")
-            return None, None, None
-        
+             print("Error: Cannot predict, features are None.")
+             return []
+
         try:
-            # Safety check for matrix dimensions
-            print(f"Feature dimensions: {features.shape}")
-            
-            # Apply model
             with torch.no_grad():
-                self.model.eval()
-                output = self.model(features)
-            
-            # Get output values - handle different model output formats
-            if isinstance(output, tuple) and len(output) == 3:
-                # Model returns separate outputs for each task
-                setup_pred, prod_pred, inv_pred = output
-                setup_np = (setup_pred.squeeze(0) > 0.5).float().numpy()
-                prod_np = prod_pred.squeeze(0).numpy()
-                inv_np = inv_pred.squeeze(0).numpy()
-            else:
-                # Model returns concatenated output
-                output_np = output.squeeze(0).numpy()
+                # Get base prediction from model
+                setup_pred, production_pred, inventory_pred = self.model(features)
                 
-                # Use the actual model's num_periods if available
-                model_periods = getattr(self, 'num_periods', num_periods)
+                # Extract setup probabilities from sigmoid output (not binary yet)
+                setup_probs = setup_pred.squeeze().numpy()
                 
-                # Get setup decisions
-                if len(output_np) >= model_periods:
-                    setup_np = (output_np[:model_periods] > 0.5).astype(float)
-                else:
-                    # Output too small, generate dummy values
-                    setup_np = np.zeros(num_periods)
+                # Convert production and inventory to numpy
+                production_np = production_pred.squeeze().numpy()
+                inventory_np = inventory_pred.squeeze().numpy()
                 
-                # Get production
-                if len(output_np) >= 2 * model_periods:
-                    prod_np = output_np[model_periods:2*model_periods]
-                else:
-                    # Output too small, generate dummy values
-                    prod_np = np.ones(num_periods) * 100  # Default production
+                # Ensure outputs match the expected number of periods
+                current_block_actual_periods = min(num_periods, self.num_periods)
                 
-                # Get inventory
-                if len(output_np) >= 3 * model_periods:
-                    inv_np = output_np[2*model_periods:3*model_periods]
-                else:
-                    # Output too small, generate dummy values
-                    inv_np = np.ones(num_periods) * 20  # Default inventory
-            
-            # Ensure predictions have the right size
-            if len(setup_np) != num_periods:
-                # Resize to match expected size
-                if len(setup_np) > num_periods:
-                    setup_np = setup_np[:num_periods]
-                else:
-                    # Pad with zeros
-                    setup_np = np.pad(setup_np, (0, num_periods - len(setup_np)))
-            
-            if len(prod_np) != num_periods:
-                # Resize to match expected size
-                if len(prod_np) > num_periods:
-                    prod_np = prod_np[:num_periods]
-                else:
-                    # Pad with values
-                    prod_np = np.pad(prod_np, (0, num_periods - len(prod_np)), 
-                                     constant_values=100)  # Default production
-            
-            if len(inv_np) != num_periods:
-                # Resize to match expected size
-                if len(inv_np) > num_periods:
-                    inv_np = inv_np[:num_periods]
-                else:
-                    # Pad with values
-                    inv_np = np.pad(inv_np, (0, num_periods - len(inv_np)), 
-                                   constant_values=20)  # Default inventory
-            
-            # Debug output
-            print(f"Predicted setup: {setup_np}")
-            print(f"Predicted production: {prod_np[:3]}... (len={len(prod_np)})")
-            print(f"Predicted inventory: {inv_np[:3]}... (len={len(inv_np)})")
-            
-            return setup_np, prod_np, inv_np
-        
+                # Keep only predictions relevant to this block
+                setup_probs = setup_probs[:current_block_actual_periods]
+                production_np = production_np[:current_block_actual_periods]
+                inventory_np = inventory_np[:current_block_actual_periods]
+                
+                # Generate alternative setup decisions with two different methods
+                flip_based_alts = self.generate_alternative_setups(setup_probs, self.k)
+                diverse_alts = self.generate_diverse_alternatives(setup_probs, self.k)
+                
+                # Combine both types of alternatives, eliminating duplicates
+                all_setups = []
+                for setup in flip_based_alts + diverse_alts:
+                    # Check if this setup is already in our list
+                    is_duplicate = False
+                    for existing_setup in all_setups:
+                        if np.array_equal(setup, existing_setup):
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        all_setups.append(setup)
+                
+                # Create final solutions list with unique setups
+                solutions = []
+                for setup in all_setups[:self.k]:  # Limit to k solutions
+                    solutions.append((setup, production_np, inventory_np))
+                
+                # Update prediction time
+                self.prediction_time = time.time() - start_time
+                
+                # Return the solutions
+                return solutions
+
         except Exception as e:
-            print(f"Error in ML prediction: {str(e)}")
-            traceback = sys.exc_info()[2]
-            if traceback:
-                print(f"Error at line: {traceback.tb_lineno}")
-            return None, None, None
-    
-    def predict_production_plan(self, fixed_setups, scenario):
-        """Predict an optimal production plan given fixed setups and demands.
+            print(f"Top-K prediction error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    # Keep the original method for backward compatibility
+    def predict_subproblem_solution(self, features, num_periods):
+        """
+        Original prediction method that returns only the best solution.
         
         Args:
-            fixed_setups: Dictionary mapping time periods to setup decisions (True/False)
-            scenario: ScenarioData object containing demand information
+            features: Input features tensor
+            num_periods: Number of periods in the current block
             
         Returns:
-            Tuple of (production_plan, inventory_plan)
+            Tuple of (setup_binary, production_np, inventory_np) or (None, None, None) on failure
         """
-        if not self.is_loaded or self.model is None:
-            # If model is not loaded, return None to indicate no prediction
-            return None, None
+        solutions = self.predict_top_k_solutions(features, num_periods)
+        if solutions:
+            return solutions[0]  # Return the first (highest probability) solution
+        else:
+            return None, None, None
+    
+    def set_k(self, new_k: int):
+        """
+        Change the number of alternative solutions to generate.
         
-        try:
-            # Prepare input features
-            input_tensor = self.prepare_features(fixed_setups, scenario)
-            
-            if input_tensor is None:
-                return None, None
-            
-            # Get prediction - use the predict_subproblem_solution method
-            setup, production, inventory = self.predict_subproblem_solution(
-                input_tensor, len(scenario.demands))
-            
-            return production, inventory
-        
-        except Exception as e:
-            print(f"ML prediction error: {str(e)}")
-            traceback = sys.exc_info()[2]
-            if traceback:
-                print(f"Error at line: {traceback.tb_lineno}")
-            return None, None
+        Args:
+            new_k: New number of solutions to generate
+        """
+        if new_k > 0:
+            self.k = new_k
+            print(f"Updated predictor to generate {self.k} alternative solutions")
+        else:
+            print("Error: k must be a positive integer")

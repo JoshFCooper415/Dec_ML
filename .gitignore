@@ -3,3 +3,4 @@ results
 venv
 all_python_files.txt
 temp.py
+benchmark_results

@@ -1,329 +1,296 @@
 """
-Standalone data generator for production planning ML.
+Record subproblem solutions for ML training.
 
-This script generates training data without depending on any external modules.
+This script uses the MLBendersDecomposition class to solve problems and records
+the subproblem solutions to use as training data for the ML model.
 """
 
 import os
-import argparse
+import time
+import pickle
 import numpy as np
 import random
-import time
-from dataclasses import dataclass
-from typing import List, Set, Dict, Tuple
-import gurobipy as gp
-from gurobipy import GRB
+from typing import List, Dict, Tuple, Set
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    print("Warning: tqdm not installed. Using simple progress reporting.")
-    # Create a simple tqdm replacement
-    class tqdm:
-        def __init__(self, total, desc=None):
-            self.total = total
-            self.n = 0
-            self.desc = desc
-            if desc:
-                print(f"{desc}: 0/{total}")
-            
-        def update(self, n):
-            self.n += n
-            if self.desc:
-                print(f"{self.desc}: {self.n}/{self.total}")
-            
-        def close(self):
-            pass
+# Import the required modules from the existing code
+from data.problem_generator import create_test_problem
+from data.data_structures import ScenarioData, ProblemParameters, TimingStats, Solution
+from models.benders import MLBendersDecomposition
+from solvers.scenario import MLScenarioSubproblem
+from solvers.timeblock import MLTimeBlockSubproblem
 
-# Define data structures inline to avoid import issues
-@dataclass
-class ScenarioData:
-    """Data class for storing scenario information."""
-    demands: List[float]
-    probability: float
-
-@dataclass
-class ProblemParameters:
-    """Data class for storing problem parameters."""
-    total_periods: int
-    periods_per_block: int
-    capacity: float
-    fixed_cost: float
-    holding_cost: float
-    production_cost: float
-    scenarios: List[ScenarioData]
-    linking_periods: Set[int]
-
-def create_test_problem(num_periods: int = 12, num_scenarios: int = 3, seed: int = 42) -> ProblemParameters:
-    """Create a test problem instance."""
-    random.seed(seed)
+def collect_subproblem_data(params: ProblemParameters, 
+                           save_dir: str = "ml_training_data",
+                           max_iterations: int = 20):
+    """
+    Run Benders decomposition and record subproblem solutions for ML training.
     
-    scenarios = []
-    
-    # Generate random demand scenarios
-    base_demand = 100
-    for _ in range(num_scenarios):
-        demands = [
-            base_demand * (1 + 0.3 * random.uniform(-1, 1))
-            for _ in range(num_periods)
-        ]
-        scenarios.append(ScenarioData(
-            demands=demands,
-            probability=1.0/num_scenarios
-        ))
-    
-    # Define linking periods (every third period)
-    linking_periods = set(range(0, num_periods, 3))
-    
-    return ProblemParameters(
-        total_periods=num_periods,
-        periods_per_block=3,
-        capacity=300,
-        fixed_cost=1000,
-        holding_cost=5,
-        production_cost=10,
-        scenarios=scenarios,
-        linking_periods=linking_periods
-    )
-
-def solve_single_block(params, start_period, num_periods, initial_inventory, scenario_data):
-    """Solve a single time block subproblem."""
-    model = gp.Model("TimeBlock")
-    model.setParam('OutputFlag', 0)
-    
-    # Variables
-    setup_vars = {}
-    prod_vars = {}
-    inv_vars = {}
-    
-    for t in range(num_periods):
-        setup_vars[t] = model.addVar(vtype=GRB.BINARY, name=f"setup[{t}]")
-        prod_vars[t] = model.addVar(vtype=GRB.CONTINUOUS, name=f"production[{t}]")
-    
-    for t in range(num_periods + 1):
-        inv_vars[t] = model.addVar(vtype=GRB.CONTINUOUS, name=f"inventory[{t}]")
-    
-    # Fix initial inventory
-    inv_vars[0].lb = initial_inventory
-    inv_vars[0].ub = initial_inventory
-    
-    # Constraints
-    for t in range(num_periods):
-        period = start_period + t
+    Args:
+        params: Problem parameters
+        save_dir: Directory to save training data
+        max_iterations: Maximum number of Benders iterations
         
-        # Inventory balance
-        model.addConstr(
-            inv_vars[t] + prod_vars[t] == 
-            scenario_data.demands[period] + inv_vars[t+1],
-            name=f"balance_{t}"
-        )
-        
-        # Capacity constraint
-        model.addConstr(
-            prod_vars[t] <= params.capacity * setup_vars[t],
-            name=f"capacity_{t}"
-        )
+    Returns:
+        Dictionary containing collected training data
+    """
+    print(f"Collecting subproblem data for problem with {params.total_periods} periods and {len(params.scenarios)} scenarios...")
     
-    # Objective
-    obj = (gp.quicksum(params.fixed_cost * setup_vars[t] + 
-                      params.production_cost * prod_vars[t] + 
-                      params.holding_cost * inv_vars[t]
-                      for t in range(num_periods)))
-    model.setObjective(obj, GRB.MINIMIZE)
+    # Create output directory if it doesn't exist
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     
-    # Solve
-    model.optimize()
+    # Initialize Benders without ML
+    benders = MLBendersDecomposition(params, use_ml=False)
     
-    if model.status != GRB.OPTIMAL:
-        raise ValueError("Failed to solve time block subproblem")
-    
-    # Extract solution
-    setup = [setup_vars[t].x > 0.5 for t in range(num_periods)]
-    production = [prod_vars[t].x for t in range(num_periods)]
-    inventory = [inv_vars[t].x for t in range(num_periods)]
-    
-    return {
-        'setup': setup,
-        'production': production,
-        'inventory': inventory
+    # Create containers for training data
+    training_data = {
+        'X_setup': [],      # Setup variables from master
+        'X_params': [],     # Problem parameters
+        'X_demands': [],    # Demands
+        'X_init_inv': [],   # Initial inventory
+        'y_setup': [],      # Optimal setup decisions
+        'y_production': [], # Optimal production amounts
+        'y_inventory': [],  # Optimal inventory levels
     }
-
-def generate_training_data(block_size, num_samples, seed=42, varied_params=True):
-    """Generate training data for a specific block size."""
-    random.seed(seed)
-    np.random.seed(seed)
     
-    X_setup = []
-    X_params = []
-    X_demands = []
-    X_init_inv = []
+    # Add a hook to capture subproblem solutions
+    original_solve_recursive = MLScenarioSubproblem.solve_recursive
     
-    y_setup = []
-    y_production = []
-    y_inventory = []
-    
-    problem_ids = []
-    sample_idx = 0
-    
-    # Progress tracking
-    pbar = tqdm(total=num_samples, desc=f"Generating data for block size {block_size}")
-    
-    while sample_idx < num_samples:
-        # Randomly vary parameters if requested
-        if varied_params:
-            capacity = random.uniform(200, 400)
-            fixed_cost = random.uniform(800, 1200)
-            holding_cost = random.uniform(3, 7)
-            production_cost = random.uniform(8, 12)
-            num_periods = random.randint(max(block_size + 3, 12), max(block_size + 10, 24))
-            num_scenarios = 1  # We generate one scenario at a time for training data
-        else:
-            capacity = 300
-            fixed_cost = 1000
-            holding_cost = 5
-            production_cost = 10
-            num_periods = max(block_size + 6, 16)
-            num_scenarios = 1
+    def solve_recursive_with_capture(self, fixed_setups):
+        """Wrapper to capture subproblem solutions during solve."""
+        result, solution_data = original_solve_recursive(self, fixed_setups)
         
-        # Create a problem instance
-        problem_seed = seed + sample_idx
-        params = create_test_problem(
-            num_periods=num_periods,
-            num_scenarios=num_scenarios,
-            seed=problem_seed
-        )
-        
-        # Override with our parameters
-        params.capacity = capacity
-        params.fixed_cost = fixed_cost
-        params.holding_cost = holding_cost
-        params.production_cost = production_cost
-        params.periods_per_block = block_size
-        
-        # Randomly sample some initial inventory values
-        max_blocks = (num_periods - block_size + 1)
-        num_blocks_to_sample = min(max_blocks, 3)  # Sample up to 3 blocks per problem
-        
-        for _ in range(num_blocks_to_sample):
-            # Random start period (ensure we have a full block)
-            start_period = random.randint(0, num_periods - block_size)
-            
-            # Random initial inventory
-            initial_inv = random.uniform(0, capacity * 0.5)
-            
-            # Random fixed setups for some periods
-            fixed_setups = {}
-            setup_features = np.zeros(block_size)
-            
-            # With 30% probability, fix some setups
-            if random.random() < 0.3:
-                num_fixed = random.randint(1, max(1, block_size // 3))
-                fixed_periods = random.sample(range(block_size), num_fixed)
+        # Only record feasible solutions
+        if result != float('inf') and solution_data:
+            # Process each time block
+            for i, block in enumerate(self.time_blocks):
+                # Get block boundaries
+                start_idx = block.start_period
+                block_size = block.num_periods
                 
-                for t in fixed_periods:
-                    is_setup = random.random() > 0.5
-                    fixed_setups[start_period + t] = is_setup
-                    setup_features[t] = 1 if is_setup else 0
-            
-            try:
-                # Solve the block
-                solution = solve_single_block(
-                    params=params,
-                    start_period=start_period,
-                    num_periods=block_size,
-                    initial_inventory=initial_inv,
-                    scenario_data=params.scenarios[0]  # First scenario
-                )
+                # Extract setup decisions from master
+                setup_features = np.zeros(block_size)
+                for t in range(block_size):
+                    period = start_idx + t
+                    if period in fixed_setups and fixed_setups[period]:
+                        setup_features[t] = 1.0
                 
                 # Extract demands for this block
-                demands = params.scenarios[0].demands[start_period:start_period + block_size]
+                demands = np.array(self.scenario_data.demands[start_idx:start_idx+block_size])
                 
-                # Record features
-                X_setup.append(setup_features)
-                X_params.append([capacity, fixed_cost, holding_cost, production_cost])
-                X_demands.append(demands)
-                X_init_inv.append(initial_inv)
+                # Get problem parameters
+                params_vector = np.array([
+                    self.params.capacity,
+                    self.params.fixed_cost,
+                    self.params.holding_cost,
+                    self.params.production_cost
+                ])
                 
-                # Record targets
-                y_setup.append(solution['setup'])
-                y_production.append(solution['production'])
-                y_inventory.append(solution['inventory'])
+                # Get initial inventory (from previous block or 0)
+                initial_inv = 0.0
+                if i > 0 and hasattr(block, 'model') and block.model:
+                    try:
+                        # Try to get initial inventory from the model variable
+                        inv_var = block.model.getVarByName("inventory[0]")
+                        if inv_var:
+                            initial_inv = inv_var.x
+                    except:
+                        # Fall back to estimating from solution
+                        initial_inv = solution_data['inventory'][start_idx-1] if start_idx > 0 else 0.0
                 
-                # Track problem ID
-                problem_ids.append(problem_seed)
+                # Extract output variables (setups, production, inventory) for this block
+                y_setup = []
+                y_production = []
+                y_inventory = []
                 
-                sample_idx += 1
-                pbar.update(1)
+                for t in range(block_size):
+                    period = start_idx + t
+                    if period < len(solution_data['setup']):
+                        y_setup.append(float(solution_data['setup'][period]))
+                    else:
+                        y_setup.append(0.0)
+                        
+                    if period < len(solution_data['production']):
+                        y_production.append(solution_data['production'][period])
+                    else:
+                        y_production.append(0.0)
+                        
+                    if period < len(solution_data['inventory']):
+                        y_inventory.append(solution_data['inventory'][period])
+                    else:
+                        y_inventory.append(0.0)
                 
-                # Break if we've collected enough samples
-                if sample_idx >= num_samples:
-                    break
-                    
-            except Exception as e:
-                print(f"Error solving problem: {str(e)}")
-                continue
+                # Add to training data
+                training_data['X_setup'].append(setup_features)
+                training_data['X_params'].append(params_vector)
+                training_data['X_demands'].append(demands)
+                training_data['X_init_inv'].append(initial_inv)
+                training_data['y_setup'].append(y_setup)
+                training_data['y_production'].append(y_production)
+                training_data['y_inventory'].append(y_inventory)
+                
+        return result, solution_data
     
-    pbar.close()
+    # Monkey patch the method to capture data
+    MLScenarioSubproblem.solve_recursive = solve_recursive_with_capture
     
-    # Convert to numpy arrays
-    X_setup = np.array(X_setup, dtype=float)
-    X_params = np.array(X_params, dtype=float)
-    X_demands = np.array(X_demands, dtype=float)
-    X_init_inv = np.array(X_init_inv, dtype=float)
+    try:
+        # Run Benders decomposition
+        start_time = time.time()
+        lower_bound, upper_bound, stats = benders.solve(max_iterations=max_iterations)
+        solve_time = time.time() - start_time
+        
+        print(f"Benders solved in {solve_time:.2f} seconds with {stats.num_iterations} iterations")
+        print(f"Final bounds: LB={lower_bound:.2f}, UB={upper_bound:.2f}")
+        print(f"Collected {len(training_data['X_setup'])} training samples")
+        
+        # Convert lists to numpy arrays
+        for key in training_data:
+            training_data[key] = np.array(training_data[key])
+        
+        # Save to file if a directory is provided
+        if save_dir:
+            block_size = training_data['X_setup'][0].shape[0] if len(training_data['X_setup']) > 0 else 0
+            
+            if block_size > 0:
+                output_file = os.path.join(save_dir, f"training_data_block{block_size}.npz")
+                np.savez(output_file, **training_data)
+                print(f"Training data saved to {output_file}")
+        
+    finally:
+        # Restore original method
+        MLScenarioSubproblem.solve_recursive = original_solve_recursive
     
-    y_setup = np.array(y_setup, dtype=float)
-    y_production = np.array(y_production, dtype=float)
-    y_inventory = np.array(y_inventory, dtype=float)
-    
-    problem_ids = np.array(problem_ids, dtype=int)
-    
-    # Return data in dictionary format
-    return {
-        'X_setup': X_setup,
-        'X_params': X_params,
-        'X_demands': X_demands,
-        'X_init_inv': X_init_inv,
-        'y_setup': y_setup,
-        'y_production': y_production,
-        'y_inventory': y_inventory,
-        'problem_ids': problem_ids
-    }
+    return training_data
 
-def main():
-    """Main entry point for data generation script."""
-    parser = argparse.ArgumentParser(description='Generate training data for production planning')
-    parser.add_argument('--output_dir', type=str, default='data', help='Output directory')
+def generate_multiple_datasets(
+    block_sizes: List[int] = [30],
+    num_problems: int = 10,
+    num_periods: int = 90,
+    num_scenarios_range: Tuple[int, int] = (2, 5),
+    c_values: List[int] = [3, 5, 8],  # C parameter values from the paper
+    f_values: List[int] = [1000, 10000],  # F parameter values from the paper
+    save_dir: str = "ml_training_data"
+):
+    """
+    Generate multiple datasets for different block sizes, using specified C and F parameters.
+    
+    Args:
+        block_sizes: List of block sizes to generate data for
+        num_problems: Number of problems to generate
+        num_periods: Number of periods per problem
+        num_scenarios_range: Range of scenarios per problem
+        c_values: List of capacity-to-demand ratio values (C parameter)
+        f_values: List of setup-to-holding cost ratio values (F parameter)
+        save_dir: Directory to save training data
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    for block_size in block_sizes:
+        print(f"\n===== Generating data for block size {block_size} =====")
+        
+        # Container for training data
+        training_data = {
+            'X_setup': [],
+            'X_params': [],
+            'X_demands': [],
+            'X_init_inv': [],
+            'y_setup': [],
+            'y_production': [],
+            'y_inventory': [],
+            'problem_ids': [],
+        }
+        
+        problem_counter = 0
+        
+        # Generate problems for each combination of C and F values
+        for c_value in c_values:
+            for f_value in f_values:
+                for i in range(num_problems // (len(c_values) * len(f_values)) + 1):
+                    if problem_counter >= num_problems:
+                        break
+                        
+                    # Randomly select number of scenarios
+                    num_scenarios = random.randint(num_scenarios_range[0], num_scenarios_range[1])
+                    
+                    # Generate problem with specified parameters
+                    seed = 42 + problem_counter
+                    params = create_test_problem(
+                        num_periods=num_periods,
+                        num_scenarios=num_scenarios,
+                        periods_per_block=block_size,
+                        capacity_to_demand_ratio=c_value,  # C parameter from paper
+                        setup_to_holding_ratio=f_value,    # F parameter from paper
+                        seed=seed
+                    )
+                    
+                    print(f"Problem {problem_counter+1}/{num_problems}: {num_periods} periods, {num_scenarios} scenarios, C={c_value}, F={f_value}")
+                    
+                    # Collect data for this problem
+                    problem_data = collect_subproblem_data(params, save_dir=None)
+                    
+                    # Add problem ID to each sample
+                    problem_ids = np.full(len(problem_data['X_setup']), seed)
+                    
+                    # Add to combined training data
+                    for key in training_data:
+                        if key == 'problem_ids':
+                            training_data[key].extend(problem_ids)
+                        elif key in problem_data:
+                            training_data[key].extend(problem_data[key])
+                    
+                    problem_counter += 1
+                    
+                    # Break if we've collected enough problems
+                    if problem_counter >= num_problems:
+                        break
+        
+        # Convert lists to numpy arrays
+        for key in training_data:
+            training_data[key] = np.array(training_data[key])
+        
+        # Save combined data
+        output_file = os.path.join(save_dir, f"production_planning_ml_data_block{block_size}.npz")
+        np.savez(output_file, **training_data)
+        print(f"Combined training data saved to {output_file}")
+        print(f"Total samples: {len(training_data['X_setup'])}")
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Generate training data from Benders decomposition')
     parser.add_argument('--block_sizes', type=str, default='3,6,9', help='Comma-separated list of block sizes')
-    parser.add_argument('--samples_per_size', type=int, default=1000, help='Number of samples per block size')
+    parser.add_argument('--num_problems', type=int, default=5, help='Number of problems per block size')
+    parser.add_argument('--num_periods', type=int, default=90, help='Number of periods in each problem')
+    parser.add_argument('--output_dir', type=str, default='ml_training_data', help='Output directory')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--varied_params', action='store_true', help='Vary problem parameters')
+    parser.add_argument('--c_values', type=str, default='3,5,8', help='Comma-separated list of C parameter values')
+    parser.add_argument('--f_values', type=str, default='1000,10000', help='Comma-separated list of F parameter values')
     
     args = parser.parse_args()
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Set random seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     
-    # Parse block sizes
+    # Parse block sizes and parameter values
     block_sizes = [int(size) for size in args.block_sizes.split(',')]
+    c_values = [int(c) for c in args.c_values.split(',')]
+    f_values = [int(f) for f in args.f_values.split(',')]
     
-    for block_size in block_sizes:
-        print(f"Generating data for block size {block_size}...")
-        start_time = time.time()
-        
-        data = generate_training_data(
-            block_size=block_size,
-            num_samples=args.samples_per_size,
-            seed=args.seed,
-            varied_params=args.varied_params
-        )
-        
-        # Save to file
-        output_file = os.path.join(args.output_dir, f"production_planning_ml_data_block{block_size}.npz")
-        np.savez(output_file, **data)
-        
-        duration = time.time() - start_time
-        print(f"Generated {args.samples_per_size} samples for block size {block_size} in {duration:.2f} seconds")
-        print(f"Data saved to {output_file}")
-
-if __name__ == "__main__":
-    main()
+    print(f"Generating data for block sizes: {block_sizes}")
+    print(f"Number of problems per block size: {args.num_problems}")
+    print(f"Number of periods: {args.num_periods}")
+    print(f"C parameter values: {c_values}")
+    print(f"F parameter values: {f_values}")
+    print(f"Output directory: {args.output_dir}")
+    
+    # Generate datasets
+    generate_multiple_datasets(
+        block_sizes=block_sizes,
+        num_problems=args.num_problems,
+        num_periods=args.num_periods,
+        c_values=c_values,
+        f_values=f_values,
+        save_dir=args.output_dir
+    )

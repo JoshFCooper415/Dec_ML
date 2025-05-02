@@ -14,66 +14,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-# Add the current directory to the Python path
+# Add the project root to Python path for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
+project_root = os.path.dirname(current_dir)  # Adjust this if needed
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-# Local imports
-from models import ProductionPlanningNN
+# Import the models
+from models.neural_network import ProductionPlanningNN
+from models.transformer_neural_network import TransformerProductionPlanningNN
 
-# Custom dataset for production planning data
-class ProductionPlanningDataset(torch.utils.data.Dataset):
-    """Custom PyTorch dataset for production planning data."""
-    
-    def __init__(self, npz_file):
-        """Initialize the dataset from a .npz file.
-        
-        Args:
-            npz_file: Path to the .npz file containing training data
-        """
-        data = np.load(npz_file)
-        self.X_setup = torch.FloatTensor(data['X_setup'])
-        self.X_params = torch.FloatTensor(data['X_params'])
-        self.X_demands = torch.FloatTensor(data['X_demands'])
-        self.X_init_inv = torch.FloatTensor(data['X_init_inv']).unsqueeze(1)  # Add dimension for concatenation
-        
-        self.y_setup = torch.FloatTensor(data['y_setup'])
-        self.y_production = torch.FloatTensor(data['y_production'])
-        self.y_inventory = torch.FloatTensor(data['y_inventory'])
-        
-        self.problem_ids = data['problem_ids']
-        
-        # Get dimensions
-        self.num_periods = self.X_setup.shape[1]
-        self.num_samples = len(self.X_setup)
-        
-        print(f"Loaded {self.num_samples} samples with {self.num_periods} periods each")
-
-    def __len__(self):
-        """Return the number of samples in the dataset."""
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        """Return a sample from the dataset.
-        
-        Args:
-            idx: Index of the sample to return
-            
-        Returns:
-            Tuple of (features, setup_target, production_target, inventory_target)
-        """
-        # Concatenate all features
-        features = torch.cat([
-            self.X_setup[idx],
-            self.X_params[idx],
-            self.X_demands[idx],
-            self.X_init_inv[idx]
-        ])
-        
-        # For multi-task learning, we'll return all targets
-        return features, self.y_setup[idx], self.y_production[idx], self.y_inventory[idx]
-
+# Import data utils
+from data.data_loader import ProductionPlanningDataset, create_data_loaders
 
 def create_direct_loaders(npz_file, batch_size=64):
     """Create data loaders directly from a .npz file.
@@ -88,28 +40,10 @@ def create_direct_loaders(npz_file, batch_size=64):
     Returns:
         Tuple of (train_loader, val_loader, test_loader, dataset)
     """
-    # Load dataset directly
-    dataset = ProductionPlanningDataset(npz_file)
-    
-    # Split dataset
-    train_size = int(0.7 * len(dataset))
-    val_size = int(0.15 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size]
-    )
-    
-    # Create data loaders
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size)
-    
-    return train_loader, val_loader, test_loader, dataset
+    return create_data_loaders(npz_file, batch_size=batch_size)
 
-
-def train_model(model, train_loader, val_loader, device, epochs=50, lr=0.001, setup_weight=1.0, 
-               production_weight=0.5, inventory_weight=0.5):
+def train_model(model, train_loader, val_loader, device, epochs=500, lr=0.0001, setup_weight=1e6, 
+               production_weight=1e-8, inventory_weight=1e-8):
     """Train the neural network model.
     
     Args:
@@ -351,8 +285,8 @@ def plot_training_history(train_losses, val_losses, save_path=None):
 def main():
     """Main entry point for training script."""
     parser = argparse.ArgumentParser(description='Train production planning neural network')
-    parser.add_argument('--data_dir', type=str, default='.', help='Directory containing data files')
-    parser.add_argument('--output_dir', type=str, default='.', help='Output directory for models')
+    parser.add_argument('--data_dir', type=str, default='ml_training_data', help='Directory containing data files')
+    parser.add_argument('--output_dir', type=str, default='models', help='Output directory for models')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
@@ -360,6 +294,8 @@ def main():
     parser.add_argument('--production_weight', type=float, default=0.5, help='Weight for production loss')
     parser.add_argument('--inventory_weight', type=float, default=0.5, help='Weight for inventory loss')
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
+    parser.add_argument('--model_type', type=str, default='standard', choices=['standard', 'transformer'], 
+                        help='Model type: standard or transformer-based')
     
     args = parser.parse_args()
     
@@ -370,7 +306,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Find all block data files
-    block_files = [f for f in os.listdir(args.data_dir) if f.startswith("production_planning_ml_data_block") and f.endswith(".npz")]
+    block_files = [f for f in os.listdir(args.data_dir) 
+                  if f.startswith("production_planning_ml_data_block") and f.endswith(".npz")]
     
     if not block_files:
         print("No data files found!")
@@ -382,7 +319,7 @@ def main():
     for file in block_files:
         print(f"\nTraining model for {file}")
         
-        # Create data loaders directly since we're dealing with raw files
+        # Create data loaders
         train_loader, val_loader, test_loader, dataset = create_direct_loaders(
             os.path.join(args.data_dir, file),
             batch_size=args.batch_size
@@ -392,12 +329,25 @@ def main():
         sample_features, _, _, _ = dataset[0]
         input_dim = len(sample_features)
         
-        # Initialize model
-        model = ProductionPlanningNN(
-            input_dim=input_dim,
-            num_periods=dataset.num_periods,
-            hidden_dim=args.hidden_dim
-        ).to(device)
+        # Initialize model based on selected type
+        if args.model_type == 'standard':
+            model = ProductionPlanningNN(
+                input_dim=input_dim,
+                num_periods=dataset.num_periods,
+                hidden_dim=args.hidden_dim
+            ).to(device)
+            model_name = "standard"
+        else:  # transformer model
+            model = TransformerProductionPlanningNN(
+                input_dim=input_dim,
+                num_periods=dataset.num_periods,
+                hidden_dim=args.hidden_dim,
+                num_heads=4,
+                num_layers=2
+            ).to(device)
+            model_name = "transformer"
+        
+        print(f"Initialized {model_name} model with {input_dim} input features and {dataset.num_periods} periods")
         
         # Train model
         trained_model, train_losses, val_losses = train_model(
@@ -416,14 +366,18 @@ def main():
         plot_training_history(
             train_losses, 
             val_losses,
-            save_path=os.path.join(args.output_dir, f"training_history_{os.path.basename(file).replace('.npz', '.png')}")
+            save_path=os.path.join(args.output_dir, f"training_history_{model_name}_{os.path.basename(file).replace('.npz', '.png')}")
         )
         
         # Evaluate model
         metrics = evaluate_model(trained_model, test_loader, device)
         
         # Save model
-        model_save_path = os.path.join(args.output_dir, f"production_planning_model_{os.path.basename(file).replace('.npz', '.pt')}")
+        model_save_path = os.path.join(
+            args.output_dir, 
+            f"production_planning_{model_name}_model_{os.path.basename(file).replace('.npz', '.pt')}"
+        )
+        
         torch.save({
             'model_state_dict': trained_model.state_dict(),
             'input_dim': input_dim,
@@ -431,7 +385,8 @@ def main():
             'hidden_dim': args.hidden_dim,
             'metrics': metrics,
             'train_losses': train_losses,
-            'val_losses': val_losses
+            'val_losses': val_losses,
+            'model_type': model_name
         }, model_save_path)
         
         print(f"Model saved to {model_save_path}")
