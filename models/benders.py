@@ -285,7 +285,7 @@ class MLBendersDecomposition:
                 if var is not None and abs(capacity_dual) > 1e-10:
                     # For each binary variable, add its coefficient
                     cut_expr.addTerms(capacity_dual * self.params.capacity, var)
-        
+        #pi * (r-Tx) <- do weighted average
         # Add the optimality cut: theta >= rhs + cut_expr
         constr = self.master_model.addConstr(
             theta >= rhs + cut_expr,
