@@ -15,11 +15,11 @@ class MLBendersDecomposition:
     
     def __init__(self,
              params: ProblemParameters,
-             use_ml: bool = True,
-             use_hybrid: bool = True,
+             use_ml: bool = False,
+             use_hybrid: bool = False,
              use_trust_region: bool = False,
              use_valid_cuts: bool = True,
-             use_laporte_cuts: bool = False,
+             use_laporte_cuts: bool = True,
              ml_candidates: int = 10):
         """Initialize the improved Benders decomposition solver.
         
@@ -282,10 +282,12 @@ class MLBendersDecomposition:
             if capacity_dual_key in dual_values:
                 capacity_dual = dual_values[capacity_dual_key]
                 var = self.master_model.getVarByName(f"setup[{t}]")
+                
                 if var is not None and abs(capacity_dual) > 1e-10:
-                    # For each binary variable, add its coefficient
+                    # For the proper Benders cut with binary variables,
+                    # we need to add the dual value multiplied by the capacity
                     cut_expr.addTerms(capacity_dual * self.params.capacity, var)
-        #pi * (r-Tx) <- do weighted average
+        
         # Add the optimality cut: theta >= rhs + cut_expr
         constr = self.master_model.addConstr(
             theta >= rhs + cut_expr,
@@ -356,10 +358,6 @@ class MLBendersDecomposition:
             
         Returns:
             Tuple of (objective_value, dual_values, dual_rays, primal_solution)
-            - objective_value: Optimal objective value or infinity if infeasible
-            - dual_values: Dictionary of dual values for constraints
-            - dual_rays: List of extreme rays from dual subproblem (empty if feasible)
-            - primal_solution: Dictionary of primal solution (None if infeasible)
         """
         # Get scenario data
         scenario = self.params.scenarios[scenario_idx]
@@ -368,13 +366,13 @@ class MLBendersDecomposition:
         model = gp.Model("RelaxedSubproblem")
         model.setParam('OutputFlag', 0)
         
-        # Variables with relaxed integrality
+        # Variables
         setup = {}
         production = {}
         inventory = {}
         
-        # Initialize with 0 inventory
-        initial_inventory = 0.0
+        # Initialize with 0 inventory (or from params if specified)
+        initial_inventory = getattr(self.params, 'initial_inventory', 0.0)
         
         # Add variables and constraints
         for t in range(self.params.total_periods):
@@ -426,16 +424,20 @@ class MLBendersDecomposition:
         
         # Check solution status
         if model.status == GRB.OPTIMAL:
-            # Extract dual information
+            # Extract COMPREHENSIVE dual information (this was missing before)
             dual_values = {}
             
             # Get dual values for capacity constraints
             for t in range(self.params.total_periods):
                 capacity_constr = model.getConstrByName(f"capacity[{t}]")
                 if capacity_constr is not None:
-                    # Store the dual value, particularly for linking periods
-                    if t in self.params.linking_periods:
-                        dual_values[f"capacity_dual_{t}"] = capacity_constr.Pi
+                    dual_values[f"capacity_dual_{t}"] = capacity_constr.Pi
+            
+            # Get dual values for flow balance constraints (CRUCIAL ADDITION)
+            for t in range(self.params.total_periods):
+                flow_constr = model.getConstrByName(f"flow_balance[{t}]")
+                if flow_constr is not None:
+                    dual_values[f"flow_dual_{t}"] = flow_constr.Pi
             
             # Extract primal solution
             primal_solution = {
@@ -451,11 +453,11 @@ class MLBendersDecomposition:
             model.computeIIS()
             dual_rays = []
             
-            # Create a simplified ray based on the IIS
+            # Create a more comprehensive ray based on the IIS
             ray_coeffs = [0.0] * len(self.params.linking_periods)
             ray_const = 0.0
             
-            # Build the ray from the IIS constraints
+            # Build the ray from the IIS constraints - include ALL constraint types
             for c in model.getConstrs():
                 if c.IISConstr:
                     # For capacity constraints
@@ -467,8 +469,20 @@ class MLBendersDecomposition:
                                 ray_coeffs[idx] -= self.params.capacity  # Negative coefficient
                             else:
                                 ray_coeffs[idx] += self.params.capacity  # Positive coefficient
+                    
+                    # For flow balance constraints (CRUCIAL ADDITION)
+                    elif "flow_balance" in c.ConstrName:
+                        try:
+                            period = int(c.ConstrName.split('[')[1].split(']')[0])
+                            # Account for impact on linking periods
+                            if period in self.params.linking_periods:
+                                idx = sorted(self.params.linking_periods).index(period)
+                                # Flow balance impact depends on problem structure
+                                ray_coeffs[idx] += self.params.capacity
+                        except (IndexError, ValueError):
+                            pass  # Skip if we can't parse the period
             
-            # Add a constant based on demand
+            # Add a constant based on demand (to complete the ray)
             total_demand = sum(scenario.demands)
             ray_const = total_demand * 0.1  # Small portion of total demand
             
@@ -480,8 +494,7 @@ class MLBendersDecomposition:
             
         else:
             # Other status (unexpected)
-            return float('inf'), {}, [], None
-    
+            return float('inf'), {}, [], None    
     def solve(self, max_iterations: int = 100, tolerance: float = 1e-6) -> Tuple[float, float, TimingStats]:
         """Execute Benders decomposition until gap < tolerance or max iters."""
         start = time.time()

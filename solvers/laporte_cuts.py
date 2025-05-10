@@ -107,54 +107,60 @@ class LaporteCutsGenerator:
         
         return coefficients, constant_term
     
-    def add_laporte_cut(
-        self, 
-        model: gp.Model, 
-        scenario_idx: int, 
-        fixed_setups: Dict[int, bool], 
-        objective_value: float, 
-        cut_counter: int
-    ) -> Optional[gp.Constr]:
-        """
-        Add a Laporte-Louveaux cut to the master problem as a lazy constraint.
+    def add_laporte_cut(self, model, scenario_idx, fixed_setups, objective_value, cut_counter):
+        """Add a Laporte-Louveaux cut to the master problem.
         
-        Args:
-            model: Gurobi model representing the master problem
-            scenario_idx: Index of the scenario
-            fixed_setups: Dictionary of fixed setup decisions
-            objective_value: Optimal objective value for the scenario
-            cut_counter: Counter for naming cuts
-            
-        Returns:
-            The added constraint object or None if no cut was added
+        The Laporte-Louveaux cut for binary variables has the form:
+        θ_s ≥ L_s + (v_s(xˆ) - L_s) * (Σ_{i∈xˆ} x_i - Σ_{i∉xˆ} x_i - |xˆ| + 1)
+        
+        This ensures that:
+        - When x = xˆ, the cut enforces θ_s ≥ v_s(xˆ)
+        - For all other binary x, the cut enforces θ_s ≥ L_s
         """
         if objective_value == float('inf'):
-            # Cannot add an optimality cut for an infeasible subproblem
             return None
-        
-        # Generate the Laporte cut
-        coefficients, constant_term = self.generate_laporte_cut(
-            scenario_idx, fixed_setups, objective_value
-        )
         
         # Get the value function variable for this scenario
         theta = model.getVarByName(f"theta[{scenario_idx}]")
         if theta is None:
             return None
         
-        # Create the expression for the cut
-        expr = gp.LinExpr(constant_term)
-        for i, coef in enumerate(coefficients):
-            if abs(coef) > 1e-10:  # Only add non-zero coefficients
-                var = model.getVarByName(f"setup[{i}]")
-                if var is not None:  # Only add terms for existing variables
-                    expr.addTerms(coef, var)
+        # Get the lower bound for this scenario
+        L_s = self.compute_scenario_lower_bound(scenario_idx)
         
-        # Add the constraint: theta >= expr
+        # Collect the periods with setup = 1 in current solution
+        setup_periods = set(t for t, is_setup in fixed_setups.items() if is_setup)
+        
+        # Calculate (v_s(xˆ) - L_s) coefficient
+        value_diff = objective_value - L_s
+        
+        # Create the combinatorial expression
+        expr = gp.LinExpr()
+        
+        # Add terms for ALL linking periods
+        for t in self.params.linking_periods:
+            var = model.getVarByName(f"setup[{t}]")
+            if var is not None:
+                if t in setup_periods:
+                    # For x_t = 1 in current solution
+                    expr.addTerms(1.0, var)
+                else:
+                    # For x_t = 0 in current solution
+                    expr.addTerms(-1.0, var)
+        
+        # Subtract |xˆ| and add 1
+        expr.addConstant(-len(setup_periods) + 1.0)
+        
+        # Create the full cut: θ_s ≥ L_s + (v_s(xˆ) - L_s) * expr
+        cut = L_s + value_diff * expr
+        
+        # Add the constraint
         laporte_constr = model.addConstr(
-            theta >= expr,
+            theta >= cut,
             name=f"laporte_cut_{scenario_idx}_{cut_counter}"
         )
         
-        # Return the constraint so it can be marked as lazy
+        # Set the Lazy attribute
+        laporte_constr.Lazy = 1
+        
         return laporte_constr
